@@ -1,0 +1,439 @@
+<!DOCTYPE html>
+<html lang="ja">
+<head>
+<meta charset="UTF-8">
+<title>Virtual Patchbay v23 (Help Synced)</title>
+<link href="https://fonts.googleapis.com/css2?family=Noto+Sans+JP:wght@400;500&display=swap" rel="stylesheet">
+<style>
+body {
+  margin: 0;
+  background: #1e1e1e;
+  overflow: hidden;
+  color: white;
+  font-family: "Noto Sans JP", sans-serif;
+}
+canvas {
+  display: block;
+  cursor: crosshair;
+}
+#helpBtn, .menuBtn {
+  background: #333;
+  color: white;
+  border: none;
+  border-radius: 6px;
+  padding: 5px 10px;
+  font-size: 16px;
+  cursor: pointer;
+}
+#helpBtn {
+  position: fixed;
+  top: 10px;
+  right: 10px;
+  z-index: 20;
+}
+#menuBar {
+  position: fixed;
+  top: 50px;
+  right: 10px;
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+  z-index: 20;
+}
+#helpOverlay {
+  position: fixed;
+  inset: 0;
+  background: rgba(0,0,0,0.8);
+  color: white;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  z-index: 15;
+  visibility: hidden;
+}
+#helpContent {
+  background: #222;
+  padding: 20px 30px;
+  border-radius: 12px;
+  max-width: 600px;
+  line-height: 1.6;
+  box-shadow: 0 0 20px rgba(0,0,0,0.5);
+}
+input.rename {
+  position: absolute;
+  font: 12px sans-serif;
+  padding: 0;
+  margin: 0;
+  border: none;
+  background: #333;
+  color: white;
+  outline: none;
+  text-align: center;
+  z-index: 30;
+}
+</style>
+</head>
+<body>
+<button id="helpBtn">？</button>
+<div id="menuBar">
+  <button class="menuBtn" id="newNodeBtn">＋ノード</button>
+  <button class="menuBtn" id="saveBtn">💾 保存</button>
+  <button class="menuBtn" id="loadBtn">📂 読み込み</button>
+  <button class="menuBtn" id="exportBtn">🖼 JPEG</button>
+</div>
+
+<div id="helpOverlay">
+  <div id="helpContent">
+    <h2>🎛 Virtual Patchbay 操作</h2>
+    <ul>
+      <li><b>Alt + ダブルクリック（ノード上）：</b> ノード反転</li>
+      <li><b>Shift + クリック（端子）：</b> 端子削除</li>
+      <li><b>ダブルクリック（線）：</b> 色変更 🎨</li>
+      <li><b>Shift + ダブルクリック（線）：</b> 削除</li>
+      <li><b>中クリックドラッグ：</b> 画面パン</li>
+      <li><b>Ctrl+Z / Ctrl+Y：</b> Undo / Redo</li>
+      <li><b>ホイール：</b> ズームイン / ズームアウト</li>
+      <li><b>Deleteキー：</b> 選択ノード削除</li>
+      <li><b>タイトル／端子名をダブルクリック：</b> 名前変更</li>
+      <li><b>＋IN／＋OUTクリック：</b> 端子追加</li>
+    </ul>
+    <p style="text-align:center;">クリックで閉じる</p>
+  </div>
+</div>
+
+<canvas id="patch"></canvas>
+<script>
+const canvas = document.getElementById("patch");
+const ctx = canvas.getContext("2d");
+canvas.width = window.innerWidth;
+canvas.height = window.innerHeight;
+
+// --- Pan & Zoom ---
+let panX = 0, panY = 0;
+let scale = 1, minScale = 0.3, maxScale = 3.0;
+let panning = false, panStart = {x:0, y:0};
+
+// --- Data ---
+const nodes = [], connections = [];
+let selectedNode = null, draggingNode = null, drawingLine = null, inputBox = null;
+let draggingOffset = {x:0, y:0}, labelBoxes = [];
+
+// --- Cable Colors ---
+const cableColors = ["#0f0","#0af","#f55","#ff0"];
+
+// --- UUID ---
+function uuid() {
+  if (crypto.randomUUID) return crypto.randomUUID();
+  return "xxxxxxxx-xxxx-4xxx-yxxx-xxxxxxxxxxxx".replace(/[xy]/g, c => {
+    const r = Math.random() * 16 | 0, v = c === "x" ? r : (r & 0x3 | 0x8);
+    return v.toString(16);
+  });
+}
+
+// --- Undo / Redo ---
+const history = [], historyIndexRef = {i:-1};
+function saveState(){
+  history.splice(historyIndexRef.i + 1);
+  history.push(JSON.parse(JSON.stringify({nodes, connections})));
+  historyIndexRef.i = history.length - 1;
+}
+function restoreState(s){
+  nodes.splice(0, nodes.length, ...JSON.parse(JSON.stringify(s.nodes)));
+  connections.splice(0, connections.length, ...JSON.parse(JSON.stringify(s.connections)));
+  draw();
+}
+function undo(){ if(historyIndexRef.i>0) restoreState(history[--historyIndexRef.i]); }
+function redo(){ if(historyIndexRef.i<history.length-1) restoreState(history[++historyIndexRef.i]); }
+
+// --- Helpers ---
+function toWorld(x,y){ return {x:(x - panX)/scale, y:(y - panY)/scale}; }
+function getPortById(pid){ for(const n of nodes){ for(const p of [...n.inputs, ...n.outputs]) if(p.id===pid) return p; } return null; }
+function findNodeByPort(p){ return nodes.find(n => n.inputs.includes(p) || n.outputs.includes(p)); }
+
+// --- Create Node ---
+function createNode(x,y,name="Node",ins=["In1"],outs=["Out1"]){
+  nodes.push({
+    id:uuid(), x, y, w:160, h:Math.max(ins.length, outs.length)*25+60,
+    name, flipped:false,
+    inputs:ins.map(l=>({id:uuid(),x:0,y:0,label:l})),
+    outputs:outs.map(l=>({id:uuid(),x:0,y:0,label:l}))
+  });
+}
+
+// --- Draw ---
+function drawCable(a,b,color){
+  ctx.strokeStyle = color;
+  ctx.lineWidth = 2;
+  const midX = (a.x + b.x)/2;
+  ctx.beginPath();
+  ctx.moveTo(a.x,a.y);
+  ctx.lineTo(midX,a.y);
+  ctx.lineTo(midX,b.y);
+  ctx.lineTo(b.x,b.y);
+  ctx.stroke();
+}
+
+function drawPort(p,px,py,color,align,label){
+  p.x = px; p.y = py;
+  ctx.fillStyle = color;
+  ctx.beginPath();
+  ctx.arc(px,py,6,0,Math.PI*2);
+  ctx.fill();
+  ctx.fillStyle = "#aaa";
+  ctx.textAlign = align;
+  ctx.fillText(label, align==="right" ? px-10 : px+10, py+4);
+  const w = ctx.measureText(label).width;
+  labelBoxes.push({x:(align==="right"?px-w-16:px+6),y:py-8,w:w+10,h:16,port:p,type:"port"});
+}
+
+function draw(){
+  ctx.clearRect(0,0,canvas.width,canvas.height);
+  ctx.save();
+  ctx.translate(panX,panY);
+  ctx.scale(scale,scale);
+  labelBoxes = [];
+
+  for(const n of nodes){
+    ctx.fillStyle = "#2e2e2e";
+    ctx.strokeStyle = n===selectedNode ? "#f55" : "#555";
+    ctx.lineWidth = 2;
+    ctx.fillRect(n.x,n.y,n.w,n.h);
+    ctx.strokeRect(n.x,n.y,n.w,n.h);
+
+    // Node title
+    ctx.fillStyle = "white";
+    ctx.textAlign = "center";
+    ctx.fillText(n.name,n.x+n.w/2,n.y+n.h-10);
+    labelBoxes.push({x:n.x,y:n.y+n.h-25,w:n.w,h:20,node:n,type:"title"});
+
+    // +IN / +OUT buttons
+    const btnY = n.y + 5;
+    ctx.fillStyle = "#444";
+    ctx.fillRect(n.x+5, btnY, 40, 15);
+    ctx.fillRect(n.x+n.w-45, btnY, 40, 15);
+    ctx.fillStyle = "white";
+    ctx.textAlign = "left";
+    ctx.fillText("+IN", n.x+10, btnY+12);
+    ctx.textAlign = "right";
+    ctx.fillText("+OUT", n.x+n.w-10, btnY+12);
+
+    for(let i=0;i<Math.max(n.inputs.length,n.outputs.length);i++){
+      const py = n.y+40+i*25;
+      if(!n.flipped){
+        if(n.inputs[i]) drawPort(n.inputs[i], n.x, py,"#55f","right",n.inputs[i].label);
+        if(n.outputs[i]) drawPort(n.outputs[i], n.x+n.w, py,"#5f5","left",n.outputs[i].label);
+      } else {
+        if(n.inputs[i]) drawPort(n.inputs[i], n.x+n.w, py,"#55f","left",n.inputs[i].label);
+        if(n.outputs[i]) drawPort(n.outputs[i], n.x, py,"#5f5","right",n.outputs[i].label);
+      }
+    }
+  }
+
+  for(const c of connections){
+    const a = getPortById(c.from), b = getPortById(c.to);
+    if(a && b) drawCable(a,b,c.color||cableColors[0]);
+  }
+
+  if(drawingLine) drawCable(drawingLine.start,drawingLine.end,"#aaa");
+  ctx.restore();
+}
+
+// --- Hit Tests ---
+function hitNode(x,y){ return nodes.find(n => x>n.x&&x<n.x+n.w&&y>n.y&&y<n.y+n.h); }
+function hitPort(x,y){ for(const n of nodes){ for(const p of [...n.inputs,...n.outputs]) if(Math.hypot(p.x-x,p.y-y)<8) return p; } return null; }
+function pointToSegmentDistance(px,py,x1,y1,x2,y2){
+  const A=px-x1,B=py-y1,C=x2-x1,D=y2-y1;
+  let t=(A*C+B*D)/(C*C+D*D);
+  t=Math.max(0,Math.min(1,t));
+  const xx=x1+t*C,yy=y1+t*D;
+  return Math.hypot(px-xx,py-yy);
+}
+function hitConnection(x,y){
+  const t=6;
+  for(let i=0;i<connections.length;i++){
+    const a=getPortById(connections[i].from),b=getPortById(connections[i].to);
+    if(!a||!b) continue;
+    const midX=(a.x+b.x)/2;
+    const pts=[[a.x,a.y],[midX,a.y],[midX,b.y],[b.x,b.y]];
+    for(let j=0;j<3;j++){
+      const d=pointToSegmentDistance(x,y,pts[j][0],pts[j][1],pts[j+1][0],pts[j+1][1]);
+      if(d<t) return i;
+    }
+  }
+  return -1;
+}
+
+// --- Mouse & Zoom ---
+canvas.addEventListener("mousedown",e=>{
+  if(e.button===1){
+    panning=true;
+    panStart={x:e.clientX-panX,y:e.clientY-panY};
+    return;
+  }
+  const {x,y}=toWorld(e.offsetX,e.offsetY);
+
+  if(e.shiftKey){
+    const p=hitPort(x,y);
+    if(p){
+      saveState();
+      const n=findNodeByPort(p);
+      const arr=n.inputs.includes(p)?n.inputs:n.outputs;
+      arr.splice(arr.indexOf(p),1);
+      n.h=Math.max(n.inputs.length,n.outputs.length)*25+60;
+      draw();
+    }
+    return;
+  }
+
+  selectedNode=hitNode(x,y)||null;
+  draw();
+
+  const n=selectedNode;
+  if(n){
+    const btnY=n.y+5;
+    if(x>n.x+5 && x<n.x+45 && y>btnY && y<btnY+20){
+      saveState();
+      n.inputs.push({id:uuid(),x:0,y:0,label:`In${n.inputs.length+1}`});
+      n.h=Math.max(n.inputs.length,n.outputs.length)*25+60;
+      draw();
+      return;
+    }
+    if(x>n.x+n.w-45 && x<n.x+n.w-5 && y>btnY && y<btnY+20){
+      saveState();
+      n.outputs.push({id:uuid(),x:0,y:0,label:`Out${n.outputs.length+1}`});
+      n.h=Math.max(n.inputs.length,n.outputs.length)*25+60;
+      draw();
+      return;
+    }
+  }
+
+  const p=hitPort(x,y);
+  if(p){ drawingLine={start:p,end:{x,y},from:p}; return; }
+  if(n){ draggingNode=n; draggingOffset={x:x-n.x,y:y-n.y}; }
+});
+
+canvas.addEventListener("mousemove",e=>{
+  if(panning){
+    panX=e.clientX-panStart.x;
+    panY=e.clientY-panStart.y;
+    draw();
+    return;
+  }
+  const {x,y}=toWorld(e.offsetX,e.offsetY);
+  if(draggingNode){ draggingNode.x=x-draggingOffset.x; draggingNode.y=y-draggingOffset.y; draw(); }
+  if(drawingLine){ drawingLine.end={x,y}; draw(); }
+});
+
+canvas.addEventListener("mouseup",e=>{
+  if(panning){ panning=false; return; }
+  if(drawingLine){
+    const {x,y}=toWorld(e.offsetX,e.offsetY);
+    const p=hitPort(x,y);
+    if(p){
+      saveState();
+      connections.push({from:drawingLine.from.id,to:p.id,color:cableColors[0]});
+    }
+    drawingLine=null; draw();
+  }
+  if(draggingNode){ saveState(); draggingNode=null; }
+});
+
+canvas.addEventListener("wheel", e => {
+  e.preventDefault();
+  const mouse = toWorld(e.offsetX,e.offsetY);
+  const prevScale = scale;
+  const zoom = 1.1;
+  if(e.deltaY < 0) scale *= zoom; else scale /= zoom;
+  scale = Math.max(minScale, Math.min(maxScale, scale));
+  panX -= (mouse.x*scale - mouse.x*prevScale);
+  panY -= (mouse.y*scale - mouse.y*prevScale);
+  draw();
+}, {passive:false});
+
+// --- Double Clicks ---
+canvas.addEventListener("dblclick", e=>{
+  const {x,y}=toWorld(e.offsetX,e.offsetY);
+  if(e.altKey){
+    const n=hitNode(x,y);
+    if(n){ saveState(); n.flipped=!n.flipped; draw(); }
+    return;
+  }
+  const cIndex=hitConnection(x,y);
+  if(cIndex>=0){
+    if(e.shiftKey){
+      saveState(); connections.splice(cIndex,1); draw(); return;
+    }
+    let c=connections[cIndex],i=cableColors.indexOf(c.color||cableColors[0]);
+    c.color=cableColors[(i+1)%cableColors.length];
+    draw(); return;
+  }
+  for(const box of labelBoxes){
+    if(x>box.x&&x<box.x+box.w&&y>box.y&&y<box.y+box.h){ startEditing(box); return; }
+  }
+});
+
+// --- Text Edit ---
+function startEditing(ref){
+  let value,left,top;
+  if(inputBox)inputBox.remove();
+  if(ref.type==="title"){
+    value=ref.node.name;
+    left=ref.node.x+ref.node.w/2-40;
+    top=ref.node.y+ref.node.h-25;
+  } else {
+    value=ref.port.label;
+    left=ref.port.x-40;
+    top=ref.port.y-8;
+  }
+  inputBox=document.createElement("input");
+  inputBox.className="rename";
+  inputBox.value=value;
+  inputBox.style.left=`${left*scale+panX}px`;
+  inputBox.style.top=`${top*scale+panY}px`;
+  inputBox.style.width="80px";
+  document.body.appendChild(inputBox);
+  inputBox.focus();
+  inputBox.select();
+  inputBox.addEventListener("blur",()=>{
+    saveState();
+    if(ref.type==="title") ref.node.name=inputBox.value.trim()||ref.node.name;
+    else ref.port.label=inputBox.value.trim()||ref.port.label;
+    inputBox.remove(); inputBox=null; draw();
+  });
+  inputBox.addEventListener("keydown",e=>{ if(e.key==="Enter") inputBox.blur(); });
+}
+
+// --- Menu & Keyboard ---
+newNodeBtn.onclick=()=>{ saveState(); createNode(200+Math.random()*200,200+Math.random()*100); draw(); };
+saveBtn.onclick=()=>{ localStorage.setItem("vpatchSave",JSON.stringify({nodes,connections})); alert("保存しました"); };
+loadBtn.onclick=()=>{ const d=localStorage.getItem("vpatchSave"); if(d){ const j=JSON.parse(d); nodes.splice(0,nodes.length,...j.nodes); connections.splice(0,connections.length,...j.connections); draw(); }};
+exportBtn.onclick=()=>{ const a=document.createElement("a"); a.download="patch.jpg"; a.href=canvas.toDataURL("image/jpeg",0.95); a.click(); };
+
+window.addEventListener("keydown",e=>{
+  if(inputBox) return;
+  if((e.ctrlKey||e.metaKey)&&e.key==="z") undo();
+  if((e.ctrlKey||e.metaKey)&&e.key==="y") redo();
+  if(e.key==="Delete" && selectedNode){
+    saveState();
+    const id=selectedNode.id;
+    for(let i=connections.length-1;i>=0;i--){
+      const a=getPortById(connections[i].from),b=getPortById(connections[i].to);
+      if(findNodeByPort(a).id===id||findNodeByPort(b).id===id) connections.splice(i,1);
+    }
+    nodes.splice(nodes.indexOf(selectedNode),1);
+    selectedNode=null; draw();
+  }
+});
+
+helpBtn.onclick=()=>helpOverlay.style.visibility="visible";
+helpOverlay.onclick=()=>helpOverlay.style.visibility="hidden";
+
+// --- Initial Nodes ---
+createNode(100,120,"Mixer",["Ch1","Ch2"],["Main L","Main R"]);
+createNode(420,230,"Reverb",["L","R"],["Out L","Out R"]);
+createNode(720,160,"Limiter",["L","R"],["Out"]);
+saveState();
+draw();
+</script>
+</body>
+</html>
